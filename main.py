@@ -8,11 +8,20 @@ from flask_restx import Resource, Api, fields, Namespace
 from werkzeug.datastructures import FileStorage
 import os
 import datetime
+from celery import Celery
+import jsonpickle
 
 app = Flask(__name__)
 api = Api(app)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql://hemam:hassan@localhost/mydatabase'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['CELERY_BROKER_URL'] = 'redis://localhost:6379/0'
+app.config['CELERY_RESULT_BACKEND'] = 'redis://localhost:6379/0'
+app.config['CELERY_BACKEND_URL'] = 'redis://localhost:6379/0'
+
+
+celery = Celery(app.name, broker=app.config['CELERY_BROKER_URL'])
+celery.conf.update(app.config)
 db = SQLAlchemy(app)
 
 
@@ -172,6 +181,28 @@ upload_parser = api.parser()
 upload_parser.add_argument('file', location='files',
                            type=FileStorage, required=True)
 upload_parser.add_argument('project_public_id')
+@celery.task
+def extractdata(source, upargs):
+    extract_data = Reader(source)
+    cnt = 0
+    for p in extract_data.projects:
+        print(p)
+        data = {}
+        data['title'] = p.proj_short_name
+        data['project_public_id'] = upargs
+        s = save_new_schedule(data)
+        s_p_id = s[0]['public_id']
+        wbs_dic = {}
+        for wbs in p.wbss:
+            wbsdata = {}
+            wbsdata['code'] = wbs.wbs_short_name
+            wbsdata['name'] = wbs.wbs_name
+            wbsdata['schedule_public_id'] = s_p_id
+            wbsdata['parent'] = wbs_dic.get(wbs.parent_wbs_id)
+            wbcur, stat = save_new_wbs(wbsdata)
+            wbsdata['public_ic'] = wbcur.get('public_id')
+            wbs_dic[wbs.wbs_id] = wbsdata
+        print('progress', wbs_dic)
 
 @apixer.route('/')
 class fileupload(Resource):
@@ -182,9 +213,9 @@ class fileupload(Resource):
     @api.expect(schedule)
     def post(self):
         """ Upload Files """
-        args = upload_parser.parse_args()
+        up_args = upload_parser.parse_args()
         public_id = str(uuid.uuid4())
-        uploaded_file = args['file']  # This is FileStorage instance
+        uploaded_file = up_args['file']  # This is FileStorage instance
         extension = uploaded_file.filename.split('.')[-1]
         uploaded_file.save(os.path.join(MODEL_UPLOADS, public_id + '.' + extension))
         new_model = XER(
@@ -196,36 +227,15 @@ class fileupload(Resource):
         db.session.add(new_model)
         db.session.commit()
         source = os.path.join(MODEL_UPLOADS, public_id + '.' + extension)
-        extract_data = Reader(source)
-        args['xer_id'] = public_id
-        self.extractdata(extract_data, args)
+        # extract_data = Reader(source)
+        up_args['xer_id'] = public_id
+        task = extractdata.delay(source, up_args['project_public_id'])
         return {'public_id': public_id}, 200
-
-    def extractdata(self, extract_data, args):
-        cnt = 0
-        for p in extract_data.projects:
-            print(p)
-            data = {}
-            data['title'] = p.proj_short_name
-            data['project_public_id'] = args['project_public_id']
-            s = save_new_schedule(data)
-            s_p_id = s[0]['public_id']
-            wbs_dic = {}
-            for wbs in p.wbss:
-                wbsdata = {}
-                wbsdata['code'] = wbs.wbs_short_name
-                wbsdata['name'] = wbs.wbs_name
-                wbsdata['schedule_public_id'] = s_p_id
-                wbsdata['parent'] = wbs_dic.get(wbs.parent_wbs_id)
-                wbcur, stat = save_new_wbs(wbsdata)
-                wbsdata['public_ic'] = wbcur.get('public_id')
-                wbs_dic[wbs.wbs_id] = wbsdata
-            print('progress', wbs_dic)
 
     def get(self):
         pass
 
 api.add_namespace(XERDto.api)
 # api.add_resource(fileupload, '/importxer')
-
-app.run(host='0.0.0.0', port=5000, debug=True)
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
